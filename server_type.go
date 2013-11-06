@@ -3,6 +3,7 @@ package monstrics
 import (
 	"fmt"
 	"github.com/op/go-logging"
+	"github.com/streadway/amqp"
 	"io/ioutil"
 	yaml "launchpad.net/goyaml"
 	"path/filepath"
@@ -46,6 +47,40 @@ func NewServer(filename string, log *logging.Logger) (*Server, error) {
 	}
 
 	return server, nil
+}
+
+// This setups the AMQP exchange and queue to receive data from clients (since the exchange
+// may not exist)
+func (s *Server) SetupAMQP() (c <-chan amqp.Delivery, conn *amqp.Connection, err error) {
+	conn, err = amqp.Dial(s.Amqp["url"])
+	if err != nil {
+		return
+	}
+	s.log.Info("Connected to %s", s.Amqp["url"])
+	ch, err := conn.Channel()
+	if err != nil {
+		return
+	}
+	// Declares the Exchange
+	err = ch.ExchangeDeclare(s.Amqp["exchange"], "topic", true, false, false, false, nil)
+	if err != nil {
+		return
+	}
+	// Declares the Queue
+	_, err = ch.QueueDeclare("monstrics_server", false, true, false, false, nil)
+	if err != nil {
+		return
+	}
+	err = ch.QueueBind("monstrics_server", "#", s.Amqp["exchange"], false, nil)
+	if err != nil {
+		return
+	}
+	s.log.Info("Sucessfully bound queue to exchange %s with pattern #", s.Amqp["exchange"])
+	c, err = ch.Consume("monstrics_server", "", false, false, true, false, nil)
+	if err != nil {
+		return
+	}
+	return
 }
 
 func parseActions(filename string, server *Server) (err error) {
