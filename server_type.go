@@ -7,15 +7,19 @@ import (
 	"io/ioutil"
 	yaml "launchpad.net/goyaml"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
 )
 
 type Server struct {
-	Amqp     map[string]string `amqp,flow`
-	Conf_dir string            `conf_dir`
-	Debug    bool              `debug`
-	Actions  []*Action         `,omitempty`
-	Metrics  []*Metric         `,omitempty`
-	log      logging.Logger    `,omitempty`
+	Amqp    map[string]string `amqp,flow`
+	ConfDir string            `confdir`
+	Debug   bool              `debug`
+	Actions []*Action         `,omitempty`
+	Metrics []*Metric         `,omitempty`
+	log     logging.Logger    `,omitempty`
 }
 
 func NewServer(filename string, log *logging.Logger) (*Server, error) {
@@ -29,12 +33,12 @@ func NewServer(filename string, log *logging.Logger) (*Server, error) {
 		return server, err
 	}
 
-	conf_files, err := filepath.Glob(fmt.Sprintf("%s/*.yml", server.Conf_dir))
-	if err != nil || len(conf_files) == 0 {
+	confFiles, err := filepath.Glob(fmt.Sprintf("%s/*.yml", server.ConfDir))
+	if err != nil || len(confFiles) == 0 {
 		return server, fmt.Errorf("No metric or action files found, or error while reading them: %v", err)
 	}
 
-	for _, f := range conf_files {
+	for _, f := range confFiles {
 		log.Info("Parsing file %s", f)
 		err = parseActions(f, server)
 		if err != nil {
@@ -46,7 +50,38 @@ func NewServer(filename string, log *logging.Logger) (*Server, error) {
 		}
 	}
 
+	// Convert the path lines to regexp matches
+	for _, m := range server.Metrics {
+		matchfrompath(m)
+	}
 	return server, nil
+}
+
+func matchfrompath(m *Metric) {
+	quoted := regexp.QuoteMeta(m.Path)
+	newMatch := regexp.MustCompile(`\\\*`).ReplaceAllString(quoted, `(.*)`)
+	m.match = regexp.MustCompile(newMatch)
+}
+
+func (s *Server) String() string {
+	r := fmt.Sprintf("\nAMQP: %v\n", s.Amqp)
+	r += fmt.Sprintf("Conf dir: %v\n", s.ConfDir)
+	for _, m := range s.Metrics {
+		r += fmt.Sprintf("Metric:\n")
+		r += fmt.Sprintf("Name :          %v\n", m.Name)
+		r += fmt.Sprintf("Path :          %v\n", m.Path)
+		r += fmt.Sprintf("Period:         %v\n", m.Period)
+		r += fmt.Sprintf("duration:       %v\n", m.duration)
+		r += fmt.Sprintf("Match:          %v\n", m.match)
+		r += fmt.Sprintf("Transformation: %v\n", m.Transformations)
+		r += fmt.Sprintf("Constraints:    %v\n", m.Constraints)
+		r += fmt.Sprintf("Values:         %v\n", m.Values())
+	}
+	for _, a := range s.Actions {
+		r += fmt.Sprintf("Action:\n")
+		r += fmt.Sprintf("Action: %v\n", a.Action)
+	}
+	return r
 }
 
 // This setups the AMQP exchange and queue to receive data from clients (since the exchange
@@ -83,6 +118,95 @@ func (s *Server) SetupAMQP() (c <-chan amqp.Delivery, conn *amqp.Connection, err
 	return
 }
 
+func (s *Server) ProcessMessages(msg chan string, stop chan bool) {
+	s.log.Debug("Starting message processor")
+	for {
+		select {
+		case message := <-msg:
+			s.log.Debug("Received on msg channel %s", message)
+			lines := strings.Split(message, "\n")
+			for _, line := range lines {
+				r := regexp.MustCompile(`\s+`).Split(line, 3)
+				path := r[0]
+				value, err := strconv.ParseFloat(r[1], 64)
+				if err != nil {
+					s.log.Warning("Error %v", err)
+				}
+				ts, err := strconv.ParseFloat(r[2], 64)
+				if err != nil {
+					s.log.Warning("Error %v", err)
+				}
+				s.log.Debug("%v, %v, %v", path, value, ts)
+				for _, m := range s.Metrics {
+					if m.match.MatchString(path) {
+						subs := m.match.FindStringSubmatch(path)
+						// Interesting metric
+						actual, exist := s.MetricbyPath(path)
+						if !exist {
+							// Metric path doesn't exist on the server yet
+							newMetric := m.copy()
+							if len(subs) == 2 {
+								newMetric.Name = fmt.Sprintf(m.Name, subs[1])
+							}
+							newMetric.Path = path
+							matchfrompath(newMetric)
+							newMetric.SetValue(int64(ts), value)
+							s.Metrics = append(s.Metrics, newMetric)
+						} else {
+							actual.SetValue(int64(ts), value)
+							actual.trimValues()
+						}
+					}
+				}
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (s *Server) MetricbyPath(path string) (*Metric, bool) {
+	for _, m := range s.Metrics {
+		m.RLock()
+		if m.Path == path {
+			m.RUnlock()
+			return m, true
+		}
+		m.RUnlock()
+	}
+	return &Metric{}, false
+}
+
+func periodInDuration(period string) (duration time.Duration, err error) {
+	var spec string
+	match, err := regexp.Compile(`(\d+)(\S+)?`)
+	if err != nil {
+		return
+	}
+	subs := match.FindStringSubmatch(period)
+	if len(subs) == 0 {
+		err = fmt.Errorf("Badly formatted period")
+		return
+	} else if len(subs) == 3 {
+		spec = subs[2]
+	}
+	value, err := strconv.Atoi(subs[1])
+	if err != nil {
+		return
+	}
+	switch spec {
+	case "s", "":
+		duration = time.Duration(value) * time.Second
+	case "m":
+		duration = time.Duration(value) * time.Minute
+	case "h":
+		duration = time.Duration(value) * time.Hour
+	case "d":
+		duration = time.Duration(value) * 24 * time.Hour
+	}
+	return
+}
+
 func parseActions(filename string, server *Server) (err error) {
 	var action []*Action
 	content, err := ioutil.ReadFile(filename)
@@ -113,6 +237,11 @@ func parseMetrics(filename string, server *Server) (err error) {
 	}
 	for _, m := range metric {
 		if m.Path != "" {
+			m.values = make(map[int64]float64)
+			m.duration, err = periodInDuration(m.Period)
+			if err != nil {
+				return
+			}
 			server.Metrics = append(server.Metrics, m)
 		}
 	}
